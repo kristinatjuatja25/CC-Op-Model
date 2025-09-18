@@ -1,0 +1,243 @@
+# ==============================
+# Erlang FTE Calculator
+# ==============================
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
+
+# ==============================
+# App Title
+# ==============================
+st.title("📊 Erlang FTE Calculator")  # <-- Main title
+
+# ------------------------------
+# Step 1: Upload Input File
+# ------------------------------
+st.header("📁 Step 1: Upload Input File")
+uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
+
+if uploaded_file:
+    df_input = pd.read_excel(uploaded_file)
+    st.write("Preview of uploaded data:")
+    st.dataframe(df_input.head())
+
+    # Detect time column
+    time_col_candidates = [col for col in df_input.columns if "time" in str(col).lower()]
+    if not time_col_candidates:
+        st.error("No time column detected in the uploaded file. Please include a column with 'time' in the name.")
+    else:
+        time_col = time_col_candidates[0]
+
+# ------------------------------
+# Step 2: Input Parameters
+# ------------------------------
+st.header("⚙️ Step 2: Input Parameters")
+
+# Default AHTs per lane (seconds)
+default_aht_per_lane = {
+    "Premium": 1400,
+    "Elite": 760,
+    "OS": 623,
+    "IH_L1": 429,
+    "IH_L2": 429,
+    "IH_L3": 429
+}
+
+st.subheader("Default AHTs (seconds) — update if needed")
+aht_per_lane = {}
+for lane, default in default_aht_per_lane.items():
+    aht_per_lane[lane] = st.number_input(f"AHT for {lane}", min_value=1, value=default, step=1)
+
+# Service level target and time
+sl_target = st.number_input("Service Level Target (%)", min_value=1, max_value=100, value=90, step=1)
+sl_time_seconds = st.number_input("Service Level Time (seconds)", min_value=1, value=30, step=1)
+
+# ------------------------------
+# Other Operational Parameters
+# ------------------------------
+st.subheader("Other Operational Parameters")
+
+# Maximum occupancy
+max_occupancy = st.number_input("Max Occupancy (%)", min_value=1, max_value=100, value=85, step=1)
+
+# Shrinkage (%)
+shrinkage = st.number_input("Shrinkage (%)", min_value=0, max_value=100, value=20, step=1)
+
+# FTE work hours per week
+fte_hours_per_week = st.number_input("FTE work hours per week", min_value=1.0, value=37.5, step=0.1)
+
+# Patience time (seconds)
+patience_time_seconds = st.number_input("Patience Time (seconds)", min_value=1, value=60, step=1)
+
+# Minimum call volume for Erlang calculation
+min_call_volume = st.number_input("Min Call Volume", min_value=0, value=1, step=1)
+
+# Minimum agents for low volume (allow 0)
+min_agents_for_low_volume = st.number_input("Min Agents for Low Volume", min_value=0, value=0, step=1)
+
+# ------------------------------
+# Step 3: Run Calculation
+# ------------------------------
+st.header("🧮 Step 3: Calculate Erlang A & FTEs")
+
+# Button to run calculation
+run_calc = st.button("Run Calculation")
+
+def _erlang_c_probability_of_delay(a: float, k: int) -> float:
+    """
+    Erlang C formula P(wait > 0).
+    a: offered load (erlangs)
+    k: agents (integer >= 0)
+    """
+    if k <= 0:
+        return 1.0
+    if a <= 0:
+        return 0.0
+    if k <= a:
+        return 1.0
+
+    # Stable incremental sum of a^i / i! for i=0..k-1
+    s = 0.0
+    term = 1.0  # a^0 / 0!
+    for i in range(k):
+        if i > 0:
+            term *= a / i
+        s += term
+    # Now compute a^k/k! from the last term
+    term *= a / k
+    num = term * (k / (k - a))
+    den = s + num
+    return num / den
+
+def calculate_agents_erlang_a(
+    call_volume,
+    aht_seconds,
+    sl_target_percent,
+    sl_time_seconds,
+    shrinkage,
+    max_occupancy,
+    patience_time_seconds,   # kept for interface consistency
+    min_call_volume,
+    min_agents_for_low_volume
+):
+    """
+    Dimension agents per 30-minute interval using Erlang C for service-level sizing,
+    then apply shrinkage and occupancy cap.
+    Offered load a (erlangs) for a 30-min interval: a = V * AHT_sec / 1800
+    """
+    # Minimum rule (can be 0)
+    if call_volume < min_call_volume:
+        raw_k = int(max(min_agents_for_low_volume, 0))
+    else:
+        # Offered load in erlangs for 30-min interval
+        a = (float(call_volume) * float(aht_seconds)) / 1800.0  # 30-min scaling
+        k = max(int(math.ceil(a)), 1)
+        sl_target_f = float(sl_target_percent) / 100.0
+        while True:
+            if k > 1000:  # safety cap
+                break
+            p_delay = _erlang_c_probability_of_delay(a, k)
+            if k > a and aht_seconds > 0:
+                sl = 1.0 - p_delay * math.exp(-(k - a) * (sl_time_seconds / aht_seconds))
+            else:
+                sl = 0.0
+            if sl >= sl_target_f:
+                break
+            k += 1
+        raw_k = k
+
+    # Apply shrinkage
+    shrink_factor = 1.0 - (shrinkage / 100.0)
+    sched = int(math.ceil(raw_k / shrink_factor)) if shrink_factor > 0 else raw_k
+
+    # Occupancy cap: do NOT force at least 1 agent when sched == 0
+    a_for_cap = (float(call_volume) * float(aht_seconds)) / 1800.0
+    max_occ_f = float(max_occupancy) / 100.0
+    if a_for_cap > 0 and sched > 0:
+        while (a_for_cap / sched) > max_occ_f:
+            sched += 1
+
+    # Final metrics
+    if a_for_cap <= 0 or sched <= 0:
+        final_sl = 1.0 if a_for_cap <= 0 else 0.0
+        final_occupancy = 0.0
+        p_abandon = 0.0
+    else:
+        p_delay = _erlang_c_probability_of_delay(a_for_cap, sched)
+        if sched > a_for_cap and aht_seconds > 0:
+            final_sl = 1.0 - p_delay * math.exp(-(sched - a_for_cap) * (sl_time_seconds / aht_seconds))
+        else:
+            final_sl = 0.0
+        final_occupancy = min(a_for_cap / sched, max_occ_f)
+        p_abandon = max(0.0, min(1.0, p_delay))
+
+    return {
+        "call_volume": float(call_volume),
+        "raw_agents": int(raw_k),
+        "scheduled_agents": int(sched),
+        "service_level": float(final_sl),
+        "occupancy": float(final_occupancy),
+        "abandonment_probability": float(p_abandon),
+    }
+
+if uploaded_file and run_calc:
+    rows = []
+    for seq, r in enumerate(df_input.itertuples(index=False)):
+        day = getattr(r, 'Day', 'Unknown')
+        t_val = getattr(r, time_col)
+        # Convert to HH:MM string
+        if pd.api.types.is_datetime64_any_dtype(type(t_val)):
+            hhmm = f"{t_val.hour:02d}:{t_val.minute:02d}"
+        else:
+            hhmm = str(t_val)
+
+        for lane in aht_per_lane:
+            vol = float(getattr(r, lane, 0))
+            aht_sec = aht_per_lane[lane]
+
+            res = calculate_agents_erlang_a(
+                call_volume=vol,
+                aht_seconds=aht_sec,
+                sl_target_percent=sl_target,
+                sl_time_seconds=sl_time_seconds,
+                shrinkage=shrinkage,
+                max_occupancy=max_occupancy,
+                patience_time_seconds=patience_time_seconds,
+                min_call_volume=min_call_volume,
+                min_agents_for_low_volume=min_agents_for_low_volume
+            )
+
+            rows.append({
+                "seq": seq,
+                "Lane": lane,
+                "Day": day,
+                "Interval_Time": hhmm,
+                "call_volume": res['call_volume'],
+                "raw_agents": res['raw_agents'],
+                "scheduled_agents": res['scheduled_agents'],
+                "FTEs_per_interval": (res['scheduled_agents'] * 0.5) / fte_hours_per_week,  # 30-min intervals
+                "service_level": res['service_level'] * 100,  # display as %
+                "occupancy": res['occupancy'],
+                "abandonment_probability": res['abandonment_probability']
+            })
+
+    results_full_df = pd.DataFrame(rows).sort_values(['Lane', 'seq']).drop(columns=['seq'])
+    results_df = results_full_df[['Lane', 'Day', 'Interval_Time', 'scheduled_agents']].copy()
+    total_fte = results_full_df.groupby('Lane', as_index=True)['FTEs_per_interval'].sum().to_frame('Total FTEs')
+
+    st.subheader("Total FTEs per Lane")
+    st.dataframe(total_fte)
+
+    st.subheader("Detailed Results (first 12 rows)")
+    st.dataframe(results_full_df.head(12))
+
+    # Write Excel file directly (no download button)
+    excel_filename = "erlang_a_results.xlsx"
+    with pd.ExcelWriter(excel_filename, engine='xlsxwriter') as writer:
+        results_full_df.to_excel(writer, sheet_name="Detailed Requirements", index=False)
+        total_fte.to_excel(writer, sheet_name="Total FTE Summary", index=True)
+        results_df.to_excel(writer, sheet_name="Optimizer_Input_Minimal", index=False)
+
+    # Success message
+    st.success(f"✅ Excel file has been created: {excel_filename}")
