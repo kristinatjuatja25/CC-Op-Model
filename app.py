@@ -25,6 +25,7 @@ for key, default in {
     "time_col": None,
     "results_full_df": None,
     "results_df": None,
+    "_last_uploaded_name": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -37,7 +38,7 @@ uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
 
 if uploaded_file is not None:
     # If user re-uploads a new file, reset downstream state
-    if getattr(st.session_state, "_last_uploaded_name", None) != uploaded_file.name:
+    if st.session_state._last_uploaded_name != uploaded_file.name:
         st.session_state._last_uploaded_name = uploaded_file.name
         st.session_state.results_full_df = None
         st.session_state.results_df = None
@@ -76,7 +77,7 @@ with st.expander("Default AHTs (seconds) — update if needed", expanded=False):
         with cols[i % 3]:
             aht_per_lane[lane] = st.number_input(f"AHT for {lane}", min_value=1, value=default, step=1)
 
-# Fallback if user never touches the expander
+# Fallback if user never opens/touches the expander
 if not aht_per_lane:
     aht_per_lane = default_aht_per_lane.copy()
 
@@ -95,7 +96,7 @@ min_agents_for_low_volume = st.number_input("Min Agents for Low Volume", min_val
 # Step 3: Run Erlang Calculation
 # ==============================
 st.header("🧮 Step 3: Calculate Erlang A & FTEs")
-run_calc = st.button("Run Calculation")
+run_calc = st.button("Run Calculation", key="run_calc")
 
 def _erlang_c_probability_of_delay(a: float, k: int) -> float:
     if k <= 0:
@@ -133,7 +134,7 @@ def calculate_agents_erlang_a(
         k = max(int(math.ceil(a)), 1)
         sl_target_f = float(sl_target_percent) / 100.0
         while True:
-            if k > 1000:
+            if k > 1000:  # safety
                 break
             p_delay = _erlang_c_probability_of_delay(a, k)
             if k > a and aht_seconds > 0:
@@ -288,7 +289,8 @@ with colR:
     others_open   = st.text_input("Others open (blank=24/7)", value="")
     others_close  = st.text_input("Others close (blank=24/7)", value="")
 
-run_optimizer = st.button("Run Optimizer")
+# Single button instance to avoid duplicate element ID
+run_optimizer = st.button("Run Optimizer", key="run_optimizer")
 
 # ==============================
 # Optimizer function (reads results_df from session_state)
@@ -675,7 +677,6 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
 # ==============================
 # Trigger optimizer (uses session_state.results_df)
 # ==============================
-run_optimizer = st.button("Run Optimizer")
 if run_optimizer:
     results_df_ss = st.session_state.results_df
     if results_df_ss is None or results_df_ss.empty:
@@ -696,7 +697,8 @@ if run_optimizer:
                 "📥 Download Staffing_Optimization.xlsx",
                 data=opt_out["excel_bytes"],
                 file_name="Staffing_Optimization.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_optimizer_xlsx"
             )
             st.success("✅ Optimizer completed with deterministic settings (CBC, random_seed=1234).")
         except Exception as e:
