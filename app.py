@@ -19,25 +19,40 @@ except Exception:
 st.set_page_config(page_title="Erlang + Staffing Optimizer", layout="wide")
 st.title("📊 Erlang FTE Calculator + 👷 Staffing Optimization")
 
+# ---------------- Session state defaults ----------------
+for key, default in {
+    "df_input": None,
+    "time_col": None,
+    "results_full_df": None,
+    "results_df": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
 # ==============================
 # Step 1: Upload Input File
 # ==============================
 st.header("📁 Step 1: Upload Input File")
 uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
 
-df_input = None
-time_col = None
-if uploaded_file:
-    df_input = pd.read_excel(uploaded_file)
-    st.write("Preview of uploaded data:")
-    st.dataframe(df_input.head())
+if uploaded_file is not None:
+    # If user re-uploads a new file, reset downstream state
+    if getattr(st.session_state, "_last_uploaded_name", None) != uploaded_file.name:
+        st.session_state._last_uploaded_name = uploaded_file.name
+        st.session_state.results_full_df = None
+        st.session_state.results_df = None
 
-    # Detect time column
-    time_col_candidates = [col for col in df_input.columns if "time" in str(col).lower()]
+    st.session_state.df_input = pd.read_excel(uploaded_file)
+    st.write("Preview of uploaded data:")
+    st.dataframe(st.session_state.df_input.head())
+
+    # Detect time column (first column with 'time' in its name)
+    time_col_candidates = [col for col in st.session_state.df_input.columns if "time" in str(col).lower()]
     if not time_col_candidates:
         st.error("No time column detected in the uploaded file. Please include a column with 'time' in the name.")
+        st.session_state.time_col = None
     else:
-        time_col = time_col_candidates[0]
+        st.session_state.time_col = time_col_candidates[0]
 
 # ==============================
 # Step 2: Erlang Input Parameters
@@ -51,7 +66,7 @@ default_aht_per_lane = {
     "OS": 623,
     "IH_L1": 429,
     "IH_L2": 429,
-    "IH_L3": 429
+    "IH_L3": 429,
 }
 
 with st.expander("Default AHTs (seconds) — update if needed", expanded=False):
@@ -61,7 +76,7 @@ with st.expander("Default AHTs (seconds) — update if needed", expanded=False):
         with cols[i % 3]:
             aht_per_lane[lane] = st.number_input(f"AHT for {lane}", min_value=1, value=default, step=1)
 
-# If user doesn’t touch the expander, Streamlit will still set defaults
+# Fallback if user never touches the expander
 if not aht_per_lane:
     aht_per_lane = default_aht_per_lane.copy()
 
@@ -161,66 +176,72 @@ def calculate_agents_erlang_a(
         "abandonment_probability": float(p_abandon),
     }
 
-# Results from Erlang
-results_full_df = None
-results_df = None
+if run_calc:
+    if st.session_state.df_input is None or st.session_state.time_col is None:
+        st.error("Please upload a valid Excel with a time column in Step 1.")
+    else:
+        rows = []
+        for seq, r in enumerate(st.session_state.df_input.itertuples(index=False)):
+            day = getattr(r, 'Day', 'Unknown')
+            t_val = getattr(r, st.session_state.time_col)
 
-if uploaded_file and run_calc and df_input is not None and time_col is not None:
-    rows = []
-    for seq, r in enumerate(df_input.itertuples(index=False)):
-        day = getattr(r, 'Day', 'Unknown')
-        t_val = getattr(r, time_col)
+            # Convert time-like values to HH:MM
+            if isinstance(t_val, pd.Timestamp):
+                hhmm = f"{t_val.hour:02d}:{t_val.minute:02d}"
+            else:
+                try:
+                    tt = pd.to_datetime(t_val)
+                    hhmm = f"{tt.hour:02d}:{tt.minute:02d}"
+                except Exception:
+                    hhmm = str(t_val)
 
-        # Convert time-like values to HH:MM
-        hhmm = None
-        if isinstance(t_val, pd.Timestamp):
-            hhmm = f"{t_val.hour:02d}:{t_val.minute:02d}"
-        else:
-            try:
-                tt = pd.to_datetime(t_val)
-                hhmm = f"{tt.hour:02d}:{tt.minute:02d}"
-            except Exception:
-                hhmm = str(t_val)
+            for lane, aht_sec in aht_per_lane.items():
+                vol = float(getattr(r, lane, 0))
+                res = calculate_agents_erlang_a(
+                    call_volume=vol,
+                    aht_seconds=aht_sec,
+                    sl_target_percent=sl_target,
+                    sl_time_seconds=sl_time_seconds,
+                    shrinkage=shrinkage,
+                    max_occupancy=max_occupancy,
+                    patience_time_seconds=patience_time_seconds,
+                    min_call_volume=min_call_volume,
+                    min_agents_for_low_volume=min_agents_for_low_volume
+                )
+                rows.append({
+                    "seq": seq,
+                    "Lane": lane,
+                    "Day": day,
+                    "Interval_Time": hhmm,
+                    "call_volume": res['call_volume'],
+                    "raw_agents": res['raw_agents'],
+                    "scheduled_agents": res['scheduled_agents'],
+                    "FTEs_per_interval": (res['scheduled_agents'] * 0.5) / fte_hours_per_week,
+                    "service_level": res['service_level'] * 100,
+                    "occupancy": res['occupancy'],
+                    "abandonment_probability": res['abandonment_probability']
+                })
 
-        for lane, aht_sec in aht_per_lane.items():
-            vol = float(getattr(r, lane, 0))
-            res = calculate_agents_erlang_a(
-                call_volume=vol,
-                aht_seconds=aht_sec,
-                sl_target_percent=sl_target,
-                sl_time_seconds=sl_time_seconds,
-                shrinkage=shrinkage,
-                max_occupancy=max_occupancy,
-                patience_time_seconds=patience_time_seconds,
-                min_call_volume=min_call_volume,
-                min_agents_for_low_volume=min_agents_for_low_volume
-            )
-            rows.append({
-                "seq": seq,
-                "Lane": lane,
-                "Day": day,
-                "Interval_Time": hhmm,
-                "call_volume": res['call_volume'],
-                "raw_agents": res['raw_agents'],
-                "scheduled_agents": res['scheduled_agents'],
-                "FTEs_per_interval": (res['scheduled_agents'] * 0.5) / fte_hours_per_week,
-                "service_level": res['service_level'] * 100,
-                "occupancy": res['occupancy'],
-                "abandonment_probability": res['abandonment_probability']
-            })
+        results_full_df = pd.DataFrame(rows).sort_values(['Lane', 'seq']).drop(columns=['seq'])
+        results_df = results_full_df[['Lane', 'Day', 'Interval_Time', 'scheduled_agents']].copy()
 
-    results_full_df = pd.DataFrame(rows).sort_values(['Lane', 'seq']).drop(columns=['seq'])
-    results_df = results_full_df[['Lane', 'Day', 'Interval_Time', 'scheduled_agents']].copy()
+        # Persist in session state so optimizer can read even after reruns
+        st.session_state.results_full_df = results_full_df
+        st.session_state.results_df = results_df
 
-    total_fte = results_full_df.groupby('Lane', as_index=True)['FTEs_per_interval'].sum().to_frame('Total FTEs')
-    st.subheader("Total FTEs per Lane")
-    st.dataframe(total_fte)
+        total_fte = results_full_df.groupby('Lane', as_index=True)['FTEs_per_interval'].sum().to_frame('Total FTEs')
+        st.subheader("Total FTEs per Lane")
+        st.dataframe(total_fte)
 
-    st.subheader("Detailed Results (first 12 rows)")
-    st.dataframe(results_full_df.head(12))
+        st.subheader("Detailed Results (first 12 rows)")
+        st.dataframe(results_full_df.head(12))
+
+# If results already exist from a previous run, show a small reminder
+if st.session_state.results_df is not None and not st.session_state.results_df.empty:
+    st.info("Erlang results are loaded in memory and ready for the optimizer.")
 
 # ==============================
-# Step 4: Staffing Optimization (always reads from results_df)
+# Step 4: Staffing Optimization (reads from session_state.results_df)
 # ==============================
 st.header("🧩 Step 4: Staffing Optimization")
 
@@ -254,7 +275,7 @@ with col2:
     pt_consec_days    = st.number_input("PT consecutive days", value=5, min_value=1, max_value=7, step=1)
 with col3:
     pt_span_hours     = st.number_input("PT span hours (incl. breaks)", value=4.0, min_value=1.0, step=0.25)
-    pt_breaks_text    = st.text_input("PT breaks minutes (comma-separated)", value="15")  # e.g. "15,15"
+    pt_breaks_text    = st.text_input("PT breaks minutes (comma-separated)", value="15")
     interval_minutes  = st.selectbox("Interval minutes", options=[15,30,60], index=1)
 
 # Lane operating windows
@@ -270,7 +291,7 @@ with colR:
 run_optimizer = st.button("Run Optimizer")
 
 # ==============================
-# Optimizer function (reads results_df from Step 3)
+# Optimizer function (reads results_df from session_state)
 # ==============================
 def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     CFG = {
@@ -551,8 +572,8 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     hc_ft = (agents_df["Agent_Type"]=="FT").sum() if not agents_df.empty else 0
     hc_pt = (agents_df["Agent_Type"]=="PT").sum() if not agents_df.empty else 0
     hc_total = len(agents_df)
-    ft_fte = hc_ft * (CFG["ft_work_hours"] * CFG["consec_days"]) / CFG["fte_hours_per_week"] if hc_ft else 0.0
-    pt_fte = hc_pt * (CFG["pt_work_hours"] * CFG["pt_consec_days"]) / CFG["fte_hours_per_week"] if hc_pt else 0.0
+    ft_fte = hc_ft * (CFG["ft_work_hours"] * (CFG["consec_days"])) / CFG["fte_hours_per_week"] if hc_ft else 0.0
+    pt_fte = hc_pt * (CFG["pt_work_hours"] * (CFG["pt_consec_days"])) / CFG["fte_hours_per_week"] if hc_pt else 0.0
     fte_total = ft_fte + pt_fte
     headcount_summary = pd.DataFrame({"Count":[hc_ft,hc_pt,hc_total],
                                       "FTE_equivalent":[ft_fte,pt_fte,fte_total]},
@@ -637,7 +658,7 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
                 expanded_daily.get(lane, {}).get('FT', pd.DataFrame()).to_excel(
                     writer, sheet_name=f"{lane}_FT_Daily_Starts"
                 )
-            if CFG["allow_part_time"] and lane in pt_schedules and not pt_schedules[lane].empty:
+            if allow_part_time and lane in pt_schedules and not pt_schedules[lane].empty:
                 pt_schedules[lane].to_excel(writer, sheet_name=f"{lane}_PT_Anchor_Starts")
                 expanded_daily.get(lane, {}).get('PT', pd.DataFrame()).to_excel(
                     writer, sheet_name=f"{lane}_PT_Daily_Starts"
@@ -652,14 +673,16 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     }
 
 # ==============================
-# Trigger optimizer (uses results_df from Step 3)
+# Trigger optimizer (uses session_state.results_df)
 # ==============================
+run_optimizer = st.button("Run Optimizer")
 if run_optimizer:
-    if results_df is None:
+    results_df_ss = st.session_state.results_df
+    if results_df_ss is None or results_df_ss.empty:
         st.error("No optimizer input found. Please run Step 3 (Erlang calculation) first.")
     else:
         try:
-            opt_out = run_staffing_optimizer(results_df)
+            opt_out = run_staffing_optimizer(results_df_ss)
             st.subheader("Headcount Summary")
             st.dataframe(opt_out["headcount_summary"])
 
