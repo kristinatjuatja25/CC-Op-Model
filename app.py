@@ -60,8 +60,9 @@ with st.expander("Default AHTs (seconds) — update if needed", expanded=False):
     for i, (lane, default) in enumerate(default_aht_per_lane.items()):
         with cols[i % 3]:
             aht_per_lane[lane] = st.number_input(f"AHT for {lane}", min_value=1, value=default, step=1)
-else:
-    # If the expander is closed, still define aht_per_lane with defaults
+
+# If user doesn’t touch the expander, Streamlit will still set defaults
+if not aht_per_lane:
     aht_per_lane = default_aht_per_lane.copy()
 
 sl_target = st.number_input("Service Level Target (%)", min_value=1, max_value=100, value=90, step=1)
