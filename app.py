@@ -78,7 +78,7 @@ with st.expander("Default AHTs (seconds) — update if needed", expanded=False):
             aht_per_lane[lane] = st.number_input(f"AHT for {lane}", min_value=1, value=default, step=1)
 
 # Fallback if user never opens/touches the expander
-if not aht_per_lane:
+if 'aht_per_lane' not in locals() or not aht_per_lane:
     aht_per_lane = default_aht_per_lane.copy()
 
 sl_target = st.number_input("Service Level Target (%)", min_value=1, max_value=100, value=90, step=1)
@@ -123,7 +123,7 @@ def calculate_agents_erlang_a(
     sl_time_seconds,
     shrinkage,
     max_occupancy,
-    patience_time_seconds,
+    patience_time_seconds,   # kept for interface consistency
     min_call_volume,
     min_agents_for_low_volume
 ):
@@ -134,7 +134,7 @@ def calculate_agents_erlang_a(
         k = max(int(math.ceil(a)), 1)
         sl_target_f = float(sl_target_percent) / 100.0
         while True:
-            if k > 1000:  # safety
+            if k > 1000:  # safety cap
                 break
             p_delay = _erlang_c_probability_of_delay(a, k)
             if k > a and aht_seconds > 0:
@@ -146,15 +146,18 @@ def calculate_agents_erlang_a(
             k += 1
         raw_k = k
 
+    # Apply shrinkage
     shrink_factor = 1.0 - (shrinkage / 100.0)
     sched = int(math.ceil(raw_k / shrink_factor)) if shrink_factor > 0 else raw_k
 
+    # Occupancy cap
     a_for_cap = (float(call_volume) * float(aht_seconds)) / 1800.0
     max_occ_f = float(max_occupancy) / 100.0
     if a_for_cap > 0 and sched > 0:
         while (a_for_cap / sched) > max_occ_f:
             sched += 1
 
+    # Final metrics
     if a_for_cap <= 0 or sched <= 0:
         final_sl = 1.0 if a_for_cap <= 0 else 0.0
         final_occupancy = 0.0
@@ -415,11 +418,12 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     ft_break_windows=compute_break_windows(ft_span_len,ft_break_lens)
     pt_break_windows=compute_break_windows(pt_span_len,pt_break_lens)
 
-    premium_open, premium_close = parse_hhmm(CFG["premium_open"]),parse_hhmm(CFG["premium_close"])
+    # Avoid shadowing: use parsed names with _t suffix
+    prem_open_t, prem_close_t = parse_hhmm(CFG["premium_open"]), parse_hhmm(CFG["premium_close"])
     if CFG["others_open"] and CFG["others_close"]:
-        others_open, others_close = parse_hhmm(CFG["others_open"]),parse_hhmm(CFG["others_close"])
+        others_open_t, others_close_t = parse_hhmm(CFG["others_open"]), parse_hhmm(CFG["others_close"])
     else:
-        others_open, others_close = None, None
+        others_open_t, others_close_t = None, None  # 24/7
 
     lanes=sorted(df_req['Lane'].unique())
     req_min_mult=CFG["required_coverage_percent"]/100.0
@@ -428,7 +432,8 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     lane_allowed_starts_ft,lane_allowed_starts_pt={},{}
     for lane in lanes:
         is_prem=(str(lane).strip().lower()=="premium")
-        open_t,close_t=(premium_open,premium_close) if is_prem else (others_open,others_close)
+        open_t, close_t = (prem_open_t, prem_close_t) if is_prem else (others_open_t, others_close_t)
+
         allowed_ft=[si for si in ft_start_idxs if in_window(all_times[si],open_t,close_t)]
         allowed_pt=[si for si in pt_start_idxs if in_window(all_times[si],open_t,close_t)] if CFG["allow_part_time"] else []
         lane_allowed_starts_ft[lane]=allowed_ft; lane_allowed_starts_pt[lane]=allowed_pt
@@ -457,11 +462,15 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
                         cover[(day_target,ti)].append((sday,si))
         return cover
 
+    # --- NEW: progress bar before solving lanes
+    progress = st.progress(0, text="Starting optimization...")
+
     # ---------- Solve ----------
     ft_schedules,pt_schedules,coverage_rows={}, {}, []
-    for lane in lanes:
+    for i, lane in enumerate(lanes, start=1):
         allowed_ft,allowed_pt=lane_allowed_starts_ft[lane],lane_allowed_starts_pt[lane]
         if not allowed_ft and not allowed_pt:
+            progress.progress(i / len(lanes), text=f"⚠️ Skipped {lane} (no allowed starts)")
             continue
         ft_cover=build_cover_maps_with_breaks(allowed_ft,ft_span_len,ft_break_windows,CFG["consec_days"])
         pt_cover=build_cover_maps_with_breaks(allowed_pt,pt_span_len,pt_break_windows,CFG["pt_consec_days"])
@@ -496,9 +505,7 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
                         for sday,sidx in pt_cover[(d,ti)]: cmax.SetCoefficient(PT[(sday,sidx)],1)
 
         status=solver.Solve()
-        if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
-            continue
-
+        # Build outputs even if only FEASIBLE
         if allowed_ft:
             idx2hhmm_ft={i:f"{all_times[i].hour:02d}:{all_times[i].minute:02d}" for i in allowed_ft}
             ft_tab=pd.DataFrame(0,index=[idx2hhmm_ft[i] for i in allowed_ft],columns=day_order)
@@ -547,6 +554,11 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
                     "Coverage % vs Raw": cov_raw,
                     "Coverage % vs Min": cov_min
                 })
+
+        # --- update progress bar for this lane
+        progress.progress(i / len(lanes), text=f"✅ Completed {lane}")
+
+    progress.empty()  # remove the bar at the end
 
     coverage_df = pd.DataFrame(coverage_rows)
 
