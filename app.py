@@ -28,12 +28,7 @@ uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
 df_input = None
 time_col = None
 if uploaded_file:
-    # IMPORTANT: keep a BytesIO copy so we can re-open the same uploaded file later (for sheet 3)
-    uploaded_bytes = uploaded_file.read()
-    uploaded_buffer = io.BytesIO(uploaded_bytes)
-
-    # Read first sheet by default for Erlang input preview
-    df_input = pd.read_excel(io.BytesIO(uploaded_bytes))
+    df_input = pd.read_excel(uploaded_file)
     st.write("Preview of uploaded data:")
     st.dataframe(df_input.head())
 
@@ -45,7 +40,7 @@ if uploaded_file:
         time_col = time_col_candidates[0]
 
 # ==============================
-# Step 2: Input Parameters (Erlang)
+# Step 2: Erlang Input Parameters
 # ==============================
 st.header("⚙️ Step 2: Erlang Input Parameters")
 
@@ -65,6 +60,9 @@ with st.expander("Default AHTs (seconds) — update if needed", expanded=False):
     for i, (lane, default) in enumerate(default_aht_per_lane.items()):
         with cols[i % 3]:
             aht_per_lane[lane] = st.number_input(f"AHT for {lane}", min_value=1, value=default, step=1)
+else:
+    # If the expander is closed, still define aht_per_lane with defaults
+    aht_per_lane = default_aht_per_lane.copy()
 
 sl_target = st.number_input("Service Level Target (%)", min_value=1, max_value=100, value=90, step=1)
 sl_time_seconds = st.number_input("Service Level Time (seconds)", min_value=1, value=30, step=1)
@@ -162,6 +160,7 @@ def calculate_agents_erlang_a(
         "abandonment_probability": float(p_abandon),
     }
 
+# Results from Erlang
 results_full_df = None
 results_df = None
 
@@ -170,6 +169,9 @@ if uploaded_file and run_calc and df_input is not None and time_col is not None:
     for seq, r in enumerate(df_input.itertuples(index=False)):
         day = getattr(r, 'Day', 'Unknown')
         t_val = getattr(r, time_col)
+
+        # Convert time-like values to HH:MM
+        hhmm = None
         if isinstance(t_val, pd.Timestamp):
             hhmm = f"{t_val.hour:02d}:{t_val.minute:02d}"
         else:
@@ -216,48 +218,12 @@ if uploaded_file and run_calc and df_input is not None and time_col is not None:
     st.subheader("Detailed Results (first 12 rows)")
     st.dataframe(results_full_df.head(12))
 
-    erlang_excel_name = "erlang_a_results.xlsx"
-    with pd.ExcelWriter(erlang_excel_name, engine='xlsxwriter') as writer:
-        results_full_df.to_excel(writer, sheet_name="Detailed Requirements", index=False)
-        total_fte.to_excel(writer, sheet_name="Total FTE Summary", index=True)
-        results_df.to_excel(writer, sheet_name="Optimizer_Input_Minimal", index=False)
-    st.success(f"✅ Created {erlang_excel_name}")
-    with open(erlang_excel_name, "rb") as f:
-        st.download_button("📥 Download Erlang Results", f, file_name=erlang_excel_name)
-
 # ==============================
-# Step 4: Staffing Optimization
+# Step 4: Staffing Optimization (always reads from results_df)
 # ==============================
-st.header("🧩 Step 4: Staffing Optimization (uses 3rd sheet of Excel or the results from Step 3)")
+st.header("🧩 Step 4: Staffing Optimization")
 
-# ---- Source selector: use Sheet 3 from uploaded Excel vs in-session results_df
-source = st.radio(
-    "Choose optimizer input source",
-    options=["Use sheet 3 of uploaded Excel (Optimizer_Input_Minimal)", "Use results from Step 3 in this session"],
-    index=0 if uploaded_file else 1
-)
-
-opt_results_df = None
-if source.startswith("Use sheet 3") and uploaded_file:
-    try:
-        # Open the same uploaded file and read the 3rd sheet by name
-        with pd.ExcelFile(io.BytesIO(uploaded_bytes)) as xls:
-            opt_results_df = pd.read_excel(xls, sheet_name="Optimizer_Input_Minimal")
-        st.success("Loaded sheet: Optimizer_Input_Minimal from the uploaded Excel.")
-    except Exception as e:
-        st.error(f"Could not read 'Optimizer_Input_Minimal' from the uploaded Excel: {e}")
-elif source.endswith("this session"):
-    if results_df is not None:
-        opt_results_df = results_df.copy()
-        st.success("Using results_df from Step 3.")
-    else:
-        st.warning("No in-session results found. Run Step 3 or choose the Excel option.")
-
-if opt_results_df is not None:
-    st.write("Preview of optimizer input:")
-    st.dataframe(opt_results_df.head())
-
-# ---- Optimizer controls (Streamlit widgets replacing input())
+# ---- Optimizer controls (Streamlit widgets)
 st.subheader("Optimizer Controls")
 colA, colB, colC = st.columns(3)
 with colA:
@@ -265,8 +231,8 @@ with colA:
     start_on_full_hour_only = st.checkbox("Start shifts on full hour only (:00)", value=False)
     allow_part_time = st.checkbox("Allow part-time shifts", value=True)
 with colB:
-    max_overstaff_pct = st.number_input("Max overstaff % (None = no cap)", value=0.0, min_value=0.0, step=1.0)
     use_overstaff_cap = st.checkbox("Enable overstaff cap", value=False)
+    max_overstaff_pct = st.number_input("Max overstaff % (if enabled)", value=0.0, min_value=0.0, step=1.0)
     cmax_reference = st.selectbox("Overstaff cap reference", options=["raw", "min"], index=0)
 with colC:
     time_limit_sec = st.number_input("Solver time limit per lane (sec)", value=60, min_value=1, step=1)
@@ -303,10 +269,9 @@ with colR:
 run_optimizer = st.button("Run Optimizer")
 
 # ==============================
-# Optimizer function (wrapped)
+# Optimizer function (reads results_df from Step 3)
 # ==============================
 def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
-    # ---- CFG (assembled from UI)
     CFG = {
         "ft_work_hours": 7.5,
         "pt_work_hours": None,  # computed from PT span & breaks
@@ -351,7 +316,7 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     if CFG["pt_work_hours"] < 0:
         raise ValueError("PT work hours became negative — check PT span and breaks.")
 
-    # ---------- Helpers (exactly as in your script) ----------
+    # ---------- Helpers ----------
     day_order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
     day_to_idx = {d:i for i,d in enumerate(day_order)}
     idx_to_day = {i:d for d,i in day_to_idx.items()}
@@ -533,8 +498,8 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
             pt_schedules[lane]=pd.DataFrame(columns=day_order)
 
         # Coverage rows
-        sub=df_req[df_req['Lane']==lane]
-        raw_need_map={(day_to_idx[r['Day']], time_to_idx[r['Interval_Time']]): float(r['scheduled_agents']) for _,r in sub.iterrows()}
+        raw_need_map={(day_to_idx[r['Day']], time_to_idx[r['Interval_Time']]): float(r['scheduled_agents'])
+                      for _,r in df_req[df_req['Lane']==lane].iterrows()}
         for d in range(7):
             for ti in range(num_intervals):
                 raw_need = int(math.ceil(raw_need_map.get((d, ti), 0.0)))
@@ -686,14 +651,14 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     }
 
 # ==============================
-# Trigger optimizer
+# Trigger optimizer (uses results_df from Step 3)
 # ==============================
 if run_optimizer:
-    if opt_results_df is None:
-        st.error("No optimizer input found. Load sheet 3 or run Step 3 first.")
+    if results_df is None:
+        st.error("No optimizer input found. Please run Step 3 (Erlang calculation) first.")
     else:
         try:
-            opt_out = run_staffing_optimizer(opt_results_df)
+            opt_out = run_staffing_optimizer(results_df)
             st.subheader("Headcount Summary")
             st.dataframe(opt_out["headcount_summary"])
 
