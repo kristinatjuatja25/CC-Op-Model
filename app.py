@@ -88,7 +88,10 @@ st.subheader("Other Operational Parameters")
 max_occupancy = st.number_input("Max Occupancy (%)", min_value=1, max_value=100, value=85, step=1)
 shrinkage = st.number_input("Shrinkage (%)", min_value=0, max_value=100, value=20, step=1)
 fte_hours_per_week = st.number_input("FTE work hours per week", min_value=1.0, value=37.5, step=0.1)
-patience_time_seconds = st.number_input("Patience Time (seconds)", min_value=1, value=60, step=1)
+
+# UPDATED DEFAULT: 30 seconds (editable)
+patience_time_seconds = st.number_input("Patience Time (seconds)", min_value=1, value=30, step=1)
+
 min_call_volume = st.number_input("Min Call Volume", min_value=0, value=1, step=1)
 min_agents_for_low_volume = st.number_input("Min Agents for Low Volume", min_value=0, value=0, step=1)
 
@@ -568,6 +571,8 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
     # ==============================
     # NEW: Add call_volume (right after Interval_Time) AND abandonment proxy (%)
     #      Call volume is taken directly from the uploaded input by lane column name.
+    #      Patience seconds is linked to the UI input field.
+    #      Abandonment % is stored as a FLOAT (not scientific notation in Excel when formatted).
     # ==============================
     if coverage_df is not None and not coverage_df.empty and st.session_state.df_input is not None:
         df_in = st.session_state.df_input.copy()
@@ -625,7 +630,8 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
         coverage_df = coverage_df.merge(base, on=["Lane", "Day", "Interval_Time"], how="left")
         coverage_df["call_volume"] = coverage_df["call_volume"].fillna(0)
 
-        patience_sec = 60.0  # average patience threshold
+        # LINKED TO UI INPUT
+        patience_sec = float(patience_time_seconds)
 
         def _abandon_pct_row(row):
             lane = row["Lane"]
@@ -634,7 +640,7 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
                 return 0.0
 
             call_vol = float(row["call_volume"])
-            a = (call_vol * aht_sec) / 1800.0  # 30-min interval (matches Step 3)
+            a = (call_vol * aht_sec) / 1800.0  # 30-min interval
             k = int(round(float(row["Total Staffed"])))
 
             # Erlang C probability of delay
@@ -645,14 +651,14 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
             else:
                 p_delay = _erlang_c_probability_of_delay(a, k)
 
-            # Waiting-time tail beyond patience: exp(-(k-a)*t/AHT), clamp rate at 0 if k<=a
+            # Waiting-time tail beyond patience
             rate = (k - a) / aht_sec
             tail = math.exp(-max(rate, 0.0) * patience_sec)
 
             p_ab = max(0.0, min(1.0, p_delay * tail))
-            return p_ab * 100.0
+            return float(p_ab * 100.0)
 
-        coverage_df["Abandon_%_60s_postopt"] = coverage_df.apply(_abandon_pct_row, axis=1)
+        coverage_df["Abandon_%_patience_postopt"] = coverage_df.apply(_abandon_pct_row, axis=1)
 
         # Reorder: put call_volume right after Interval_Time (leave everything else as-is)
         cols = list(coverage_df.columns)
@@ -760,7 +766,23 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
             ]
         }).to_excel(writer, sheet_name="READ_ME", index=False)
 
+        # Write coverage first
         coverage_df.to_excel(writer, sheet_name="Coverage_By_Interval", index=False)
+
+        # FORMAT: force % column to display as normal numbers (not scientific notation)
+        wb  = writer.book
+        ws  = writer.sheets["Coverage_By_Interval"]
+        fmt_pct = wb.add_format({"num_format": "0.000000"})  # 6 decimals; adjust if you want
+
+        # Apply format to the abandonment % column if present
+        if coverage_df is not None and not coverage_df.empty:
+            try:
+                col_idx = list(coverage_df.columns).index("Abandon_%_patience_postopt")
+                # Excel col indices are 0-based; row 0 is header; data starts row 1
+                ws.set_column(col_idx, col_idx, 18, fmt_pct)
+            except ValueError:
+                pass
+
         headcount_summary.to_excel(writer, sheet_name="Headcount_Summary")
         if not agents_df.empty:
             agents_df.to_excel(writer, sheet_name="Agent_IDs", index=False)
