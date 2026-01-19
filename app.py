@@ -567,10 +567,60 @@ def run_staffing_optimizer(results_df: pd.DataFrame) -> dict:
 
     # ==============================
     # NEW: Add call_volume (right after Interval_Time) AND abandonment proxy (%)
+    #      Call volume is taken directly from the uploaded input by lane column name.
     # ==============================
-    if coverage_df is not None and not coverage_df.empty and st.session_state.results_full_df is not None:
-        base = st.session_state.results_full_df[["Lane", "Day", "Interval_Time", "call_volume"]].copy()
+    if coverage_df is not None and not coverage_df.empty and st.session_state.df_input is not None:
+        df_in = st.session_state.df_input.copy()
+        df_in.columns = [str(c).strip() for c in df_in.columns]
+
+        # Normalize Day + Interval_Time in the uploaded data
+        if "Day" in df_in.columns:
+            df_in["Day"] = df_in["Day"].astype(str).str.strip()
+
+        # Use the detected time column from Step 1
+        tcol = st.session_state.time_col
+        if tcol is None or tcol not in df_in.columns:
+            raise ValueError("Time column not found in uploaded input (Step 1).")
+
+        def _to_hhmm_from_input(x):
+            if isinstance(x, pd.Timestamp):
+                return f"{x.hour:02d}:{x.minute:02d}"
+            try:
+                tt = pd.to_datetime(x)
+                return f"{tt.hour:02d}:{tt.minute:02d}"
+            except Exception:
+                s = str(x).strip()
+                try:
+                    tt = pd.to_datetime(s)
+                    return f"{tt.hour:02d}:{tt.minute:02d}"
+                except Exception:
+                    return s
+
+        df_in["Interval_Time"] = df_in[tcol].apply(_to_hhmm_from_input)
+
+        # Build long-form base: one row per (Lane, Day, Interval_Time)
+        lane_cols = [c for c in df_in.columns if c in aht_per_lane.keys()]
+        if not lane_cols:
+            raise ValueError("No lane columns found in uploaded input matching AHT lane names.")
+
+        base = df_in.melt(
+            id_vars=["Day", "Interval_Time"],
+            value_vars=lane_cols,
+            var_name="Lane",
+            value_name="call_volume"
+        )
+        base["Lane"] = base["Lane"].astype(str).str.strip()
+        base["Day"] = base["Day"].astype(str).str.strip()
+        base["Interval_Time"] = base["Interval_Time"].astype(str).str.strip()
         base["call_volume"] = pd.to_numeric(base["call_volume"], errors="coerce").fillna(0)
+
+        # Ensure uniqueness before merge (guards against any duplicates in input)
+        base = base.groupby(["Lane", "Day", "Interval_Time"], as_index=False)["call_volume"].sum()
+
+        # Normalize merge keys in coverage_df too
+        coverage_df["Lane"] = coverage_df["Lane"].astype(str).str.strip()
+        coverage_df["Day"] = coverage_df["Day"].astype(str).str.strip()
+        coverage_df["Interval_Time"] = coverage_df["Interval_Time"].astype(str).str.strip()
 
         coverage_df = coverage_df.merge(base, on=["Lane", "Day", "Interval_Time"], how="left")
         coverage_df["call_volume"] = coverage_df["call_volume"].fillna(0)
